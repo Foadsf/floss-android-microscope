@@ -1,5 +1,6 @@
 package com.floss.microscope.presentation.ui
 
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -13,6 +14,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.clipRect
@@ -25,6 +27,8 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.floss.microscope.domain.model.*
 import com.floss.microscope.presentation.viewmodel.ProcessingViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
 import kotlin.math.cos
@@ -342,6 +346,46 @@ fun ResultViewerScreen(
     }
 }
 
+/** Longest edge allowed for on-screen bitmaps. Keeps GPU texture uploads well inside device limits. */
+private const val MAX_DISPLAY_EDGE_PX = 4096
+
+/**
+ * Android's hardware RecordingCanvas refuses to draw bitmaps over 100 MB (ARGB_8888).
+ * Keep decoded display bitmaps under 40 MB by picking the smallest power-of-two sample size
+ * that satisfies both the edge limit and the byte budget. A 4536x6048 result becomes 2268x3024 (27 MB).
+ */
+private const val MAX_DISPLAY_BYTES = 40L * 1024 * 1024
+
+private fun decodeDisplayBitmap(path: String): Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, bounds)
+    val srcW = bounds.outWidth
+    val srcH = bounds.outHeight
+    if (srcW <= 0 || srcH <= 0) return null
+
+    var sample = 1
+    while (srcW / sample > MAX_DISPLAY_EDGE_PX ||
+        srcH / sample > MAX_DISPLAY_EDGE_PX ||
+        (srcW / sample).toLong() * (srcH / sample).toLong() * 4L > MAX_DISPLAY_BYTES
+    ) {
+        sample *= 2
+    }
+    val opts = BitmapFactory.Options().apply {
+        inSampleSize = sample
+        inPreferredConfig = Bitmap.Config.ARGB_8888
+    }
+    return BitmapFactory.decodeFile(path, opts)
+}
+
+/** Decodes off the main thread so opening a large result does not block the UI. */
+@Composable
+private fun rememberDisplayBitmap(path: String?): State<ImageBitmap?> =
+    produceState<ImageBitmap?>(initialValue = null, key1 = path) {
+        value = path?.let { p ->
+            withContext(Dispatchers.IO) { decodeDisplayBitmap(p)?.asImageBitmap() }
+        }
+    }
+
 @Composable
 private fun BeforeAfterSplitComparator(
     rawFramePath: String?,
@@ -349,12 +393,8 @@ private fun BeforeAfterSplitComparator(
     splitFraction: Float,
     modifier: Modifier = Modifier
 ) {
-    val rawBitmap = remember(rawFramePath) {
-        rawFramePath?.let { BitmapFactory.decodeFile(it)?.asImageBitmap() }
-    }
-    val enhancedBitmap = remember(enhancedImagePath) {
-        enhancedImagePath?.let { BitmapFactory.decodeFile(it)?.asImageBitmap() }
-    }
+    val rawBitmap = rememberDisplayBitmap(rawFramePath).value
+    val enhancedBitmap = rememberDisplayBitmap(enhancedImagePath).value
 
     var scale by remember { mutableStateOf(1f) }
     var pan by remember { mutableStateOf(Offset.Zero) }
